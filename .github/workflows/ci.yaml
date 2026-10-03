@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  docker-pr:
+    if: github.event_name == 'pull_request'
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build image without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: arc-runner-set
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare image metadata
+        id: metadata
+        shell: bash
+        run: |
+          printf 'tag=main-%s\n' "${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Set up remote Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: remote
+          endpoint: tcp://arc-buildkit.arc-runners.svc.cluster.local:1234
+      - name: Read registry credentials
+        id: vault
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3
+        with:
+          url: https://vault.internal.api-api-api.com
+          method: jwt
+          path: github
+          role: ci-playground-order-service
+          jwtGithubAudience: playground-ci
+          exportEnv: false
+          secrets: |
+            kv/data/ci/playground/order-service username | HARBOR_USERNAME ;
+            kv/data/ci/playground/order-service password | HARBOR_PASSWORD
+      - name: Log in to Harbor
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: harbor.internal.api-api-api.com
+          username: ${{ steps.vault.outputs.HARBOR_USERNAME }}
+          password: ${{ steps.vault.outputs.HARBOR_PASSWORD }}
+      - name: Ignore a superseded main commit
+        id: current
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test -n "$head"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "A newer main commit exists; this build will not publish."
+          fi
+      - name: Build and publish image
+        if: steps.current.outputs.publish == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            harbor.internal.api-api-api.com/playground/order-service:${{ steps.metadata.outputs.tag }}
+            harbor.internal.api-api-api.com/playground/order-service:prod
+          labels: |
+            org.opencontainers.image.title=order-service
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.tag }}
+            org.opencontainers.image.created=${{ steps.metadata.outputs.created }}

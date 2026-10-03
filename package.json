@@ -1,0 +1,43 @@
+{
+  "name": "@lab/gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "dev:relay": "tsx watch src/relay.ts",
+    "start": "node --enable-source-maps dist/index.js",
+    "start:relay": "node --enable-source-maps dist/relay.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@fastify/cors": "10.0.2",
+    "@prometheus-io/client": "0.16.1",
+    "amqplib": "0.10.5",
+    "fastify": "5.12.1",
+    "kafkajs": "2.2.4",
+    "pg": "8.16.3",
+    "pino": "9.14.0",
+    "redis": "6.2.1",
+    "ulid": "2.4.0",
+    "zod": "3.24.2",
+    "zod-to-json-schema": "3.24.5"
+  },
+  "devDependencies": {
+    "@types/amqplib": "0.10.7",
+    "@types/node": "22.13.10",
+    "@types/pg": "8.15.5",
+    "tsx": "4.19.3",
+    "typescript": "5.7.3",
+    "vitest": "3.2.7"
+  }
+}
