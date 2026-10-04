@@ -1,0 +1,166 @@
+name: Preview environment
+
+on:
+  workflow_run:
+    workflows: [ci, CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'feature/')
+    runs-on: arc-runner-set
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      # This default-branch workflow only sends metadata. It never checks out,
+      # executes, or downloads code/artifacts from the pull request.
+      - name: Read preview notification credentials from Vault
+        id: vault
+        uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3
+        with:
+          url: https://vault.internal.api-api-api.com
+          method: jwt
+          path: github
+          role: ci-playground-order-service-preview-notify
+          jwtGithubAudience: playground-ci
+          exportEnv: false
+          secrets: |
+            kv/data/ci/github-app app_id | APP_ID ;
+            kv/data/ci/github-app private_key | APP_PRIVATE_KEY
+      - name: Issue a token limited to the GitOps repository
+        id: gitops-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ steps.vault.outputs.APP_ID }}
+          private-key: ${{ steps.vault.outputs.APP_PRIVATE_KEY }}
+          owner: anomaly51
+          repositories: general-1-argocd
+          permission-contents: write
+      - name: Notify the shared preview controller
+        shell: bash
+        env:
+          SOURCE_TOKEN: ${{ github.token }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          GITOPS_TOKEN: ${{ steps.gitops-token.outputs.token }}
+          PREVIEW_SERVICE: order-service
+          PREVIEW_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          source_token = os.environ["SOURCE_TOKEN"]
+          repository = os.environ["SOURCE_REPOSITORY"]
+          run_id = int(os.environ["PREVIEW_RUN_ID"])
+          if run_id <= 0:
+              raise SystemExit("Invalid source CI run ID")
+          if repository.lower() != "anomaly51/playground-" + os.environ["PREVIEW_SERVICE"]:
+              raise SystemExit("Unexpected source repository")
+
+          def api(path, token, payload=None, method=None):
+              request = urllib.request.Request(
+                  "https://api.github.com/" + path,
+                  data=json.dumps(payload).encode() if payload is not None else None,
+                  method=method or ("POST" if payload is not None else "GET"),
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body) if body else None
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f"GitHub preview request failed: HTTP {error.code}") from None
+              except urllib.error.URLError:
+                  raise SystemExit("GitHub preview request failed: connection error") from None
+
+          run = api(f"repos/{repository}/actions/runs/{run_id}", source_token)
+          branch = run.get("head_branch", "")
+          if not (
+              run.get("conclusion") == "success"
+              and run.get("event") == "pull_request"
+              and run.get("path") == ".github/workflows/ci.yaml"
+              and run.get("head_repository", {}).get("full_name") == repository
+              and branch.startswith("feature/")
+          ):
+              raise SystemExit("The source run is not eligible for a preview")
+          query = urllib.parse.urlencode({
+              "state": "open", "head": repository.split("/")[0] + ":" + branch, "per_page": 100,
+          })
+          pulls = api(f"repos/{repository}/pulls?{query}", source_token)
+          pulls = [
+              pr for pr in pulls
+              if pr.get("state") == "open"
+              and pr.get("head", {}).get("repo", {}).get("full_name") == repository
+              and pr.get("head", {}).get("ref") == branch
+              and pr.get("head", {}).get("sha") == run.get("head_sha")
+              and pr.get("base", {}).get("repo", {}).get("full_name") == repository
+              and pr.get("author_association") in {"OWNER", "MEMBER", "COLLABORATOR"}
+          ]
+          if not pulls:
+              print("Skipping a closed, superseded, or unauthorized pull request.")
+              raise SystemExit(0)
+
+          api(
+              "repos/anomaly51/general-1-argocd/dispatches",
+              os.environ["GITOPS_TOKEN"],
+              {
+                  "event_type": "playground-preview",
+                  "client_payload": {"service": os.environ["PREVIEW_SERVICE"], "run_id": run_id},
+              },
+          )
+          slug = re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")[:24].rstrip("-")
+          preview_id = "playground-preview-" + slug + "-" + hashlib.sha256(branch.encode()).hexdigest()[:10]
+          url = "https://" + preview_id + ".internal.api-api-api.com"
+          marker = "<!-- playground-preview -->"
+          comment = (
+              marker + "\n**Preview requested — pending verification and deployment.**\n\n"
+              + "[Preview URL](" + url + ") · "
+              + "[Shared workflow](https://github.com/anomaly51/general-1-argocd/actions/workflows/preview-playground.yaml)\n\n"
+              + "The URL is usable only after the shared workflow reports the environment ready. "
+              + "Feature branches with the same exact name share this environment. "
+              + "Lifetime: 15 minutes. To renew it, run **Preview environments** in "
+              + "**general-1-argocd**, select **refresh**, and enter this PR's exact feature branch."
+          )
+          for pr in pulls:
+              number = int(pr["number"])
+              existing = None
+              for page in range(1, 11):
+                  comments = api(
+                      f"repos/{repository}/issues/{number}/comments?per_page=100&page={page}", source_token,
+                  )
+                  existing = next((
+                      item for item in comments
+                      if marker in item.get("body", "")
+                      and item.get("user", {}).get("login") == "github-actions[bot]"
+                  ), None)
+                  if existing or len(comments) < 100:
+                      break
+              if existing:
+                  api(
+                      f"repos/{repository}/issues/comments/{int(existing['id'])}",
+                      source_token, {"body": comment}, method="PATCH",
+                  )
+              else:
+                  api(f"repos/{repository}/issues/{number}/comments", source_token, {"body": comment})
+          print("Preview reconciliation requested; pending status and the shared URL are in the PR.")
+          PY
