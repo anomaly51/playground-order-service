@@ -193,7 +193,11 @@ export async function createApp(dependencies: GatewayDependencies): Promise<Fast
     maxAge: 86_400,
   });
 
-  app.get("/healthz", async () => ({ status: "ok", service: "flashdrop-order-service" }));
+  app.get("/healthz", async () => ({
+    status: "ok",
+    service: "flashdrop-order-service",
+    preview: "preview-e2e-20261004",
+  }));
   app.get("/readyz", async (_request, reply) => {
     const [processorReady, postgresReady, redisReady] = await Promise.all([
       processor.isReady(config.readinessTimeoutMs),
