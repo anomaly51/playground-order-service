@@ -1,0 +1,32 @@
+name: Promote to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      staging_commit:
+        description: Optional staging GitOps commit to promote (defaults to current staging)
+        required: false
+        type: string
+      confirm:
+        description: Promote the verified staging image to production
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: promote-prod
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main' && inputs.confirm
+    uses: anomaly51/general-1-argocd/.github/workflows/promote-playground.yaml@8fd51a1eaaf4eebb5953fe14d457048370b6344b
+    with:
+      service: order-service
+      staging_commit: ${{ inputs.staging_commit }}
+      confirm: ${{ inputs.confirm }}

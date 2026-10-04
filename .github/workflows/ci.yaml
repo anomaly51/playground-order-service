@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
 
 permissions:
@@ -49,8 +49,9 @@ jobs:
           push: false
 
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
     needs: tests
+    environment: ${{ github.ref_name == 'dev' && 'dev' || 'staging' }}
     runs-on: arc-runner-set
     timeout-minutes: 30
     permissions:
@@ -65,7 +66,12 @@ jobs:
         id: metadata
         shell: bash
         run: |
-          printf 'tag=main-%s\n' "${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s-%s\n' "$GITHUB_REF_NAME" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_NAME" == "dev" ]]; then
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=staging" >> "$GITHUB_OUTPUT"
+          fi
           printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: Set up remote Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -91,20 +97,21 @@ jobs:
           registry: harbor.internal.api-api-api.com
           username: ${{ steps.vault.outputs.HARBOR_USERNAME }}
           password: ${{ steps.vault.outputs.HARBOR_PASSWORD }}
-      - name: Ignore a superseded main commit
+      - name: Ignore a superseded branch commit
         id: current
         shell: bash
         run: |
           set -euo pipefail
-          head="$(git ls-remote origin refs/heads/main | cut -f1)"
+          head="$(git ls-remote --exit-code origin "refs/heads/$GITHUB_REF_NAME" | cut -f1)"
           test -n "$head"
           if [[ "$head" == "$GITHUB_SHA" ]]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "A newer main commit exists; this build will not publish."
+            echo "A newer branch commit exists; this build will not publish."
           fi
       - name: Build and publish image
+        id: build
         if: steps.current.outputs.publish == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -113,10 +120,52 @@ jobs:
           push: true
           tags: |
             harbor.internal.api-api-api.com/playground/order-service:${{ steps.metadata.outputs.tag }}
-            harbor.internal.api-api-api.com/playground/order-service:prod
+            harbor.internal.api-api-api.com/playground/order-service:${{ steps.metadata.outputs.channel }}
           labels: |
             org.opencontainers.image.title=order-service
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
+            io.gitops.source-branch=${{ github.ref_name }}
             org.opencontainers.image.version=${{ steps.metadata.outputs.tag }}
             org.opencontainers.image.created=${{ steps.metadata.outputs.created }}
+      - name: Record published image provenance
+        if: steps.current.outputs.publish == 'true'
+        shell: bash
+        env:
+          RELEASE_SERVICE: order-service
+          RELEASE_REPOSITORY: harbor.internal.api-api-api.com/playground/order-service
+          RELEASE_SOURCE_REPOSITORY: ${{ github.repository }}
+          RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_SOURCE_BRANCH: ${{ github.ref_name }}
+          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          digest = os.environ["RELEASE_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("The published image digest is missing or invalid")
+          release = {
+              "service": os.environ["RELEASE_SERVICE"],
+              "repository": os.environ["RELEASE_REPOSITORY"],
+              "source_repository": os.environ["RELEASE_SOURCE_REPOSITORY"],
+              "source_commit": os.environ["RELEASE_SOURCE_COMMIT"],
+              "source_branch": os.environ["RELEASE_SOURCE_BRANCH"],
+              "digest": digest,
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "release-image.json"
+          path.write_text(json.dumps(release, indent=2, sort_keys=True) + "\n")
+          print(f"Recorded published image digest: {digest}")
+          PY
+      - name: Upload published image provenance
+        if: steps.current.outputs.publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-image
+          path: ${{ runner.temp }}/release-image.json
+          if-no-files-found: error
+          retention-days: 90
