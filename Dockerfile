@@ -1,3 +1,4 @@
+# Disposable PR: verify native preview image selection for API and outbox relay.
 FROM node:22.23.2-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
