@@ -53,6 +53,8 @@ jobs:
   publish:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
     needs: tests
+    outputs:
+      published: ${{ steps.current.outputs.publish }}
     environment: ${{ github.ref_name == 'dev' && 'dev' || 'staging' }}
     runs-on: arc-runner-set
     timeout-minutes: 30
@@ -69,11 +71,6 @@ jobs:
         shell: bash
         run: |
           printf 'tag=%s-%s\n' "$GITHUB_REF_NAME" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          if [[ "$GITHUB_REF_NAME" == "dev" ]]; then
-            echo "channel=dev" >> "$GITHUB_OUTPUT"
-          else
-            echo "channel=staging" >> "$GITHUB_OUTPUT"
-          fi
           printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: Set up remote Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -122,7 +119,6 @@ jobs:
           push: true
           tags: |
             harbor.internal.api-api-api.com/playground/order-service:${{ steps.metadata.outputs.tag }}
-            harbor.internal.api-api-api.com/playground/order-service:${{ steps.metadata.outputs.channel }}
           labels: |
             org.opencontainers.image.title=order-service
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -171,3 +167,18 @@ jobs:
           path: ${{ runner.temp }}/release-image.json
           if-no-files-found: error
           retention-days: 90
+
+  publish-gitops:
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') &&
+      needs.publish.result == 'success' &&
+      needs.publish.outputs.published == 'true'
+    needs: publish
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: anomaly51/general-1-argocd/.github/workflows/publish-playground.yaml@6c75be6a6c2848ac11d56572d8c24d4d2206bb37
+    with:
+      service: order-service
